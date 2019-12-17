@@ -1,99 +1,68 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Linq.Expressions;
-using System.Text;
 using System.Reflection;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Internal;
 using Microsoft.EntityFrameworkCore.Query;
 using Microsoft.EntityFrameworkCore.Query.Internal;
+using Microsoft.EntityFrameworkCore.Query.SqlExpressions;
 using Microsoft.EntityFrameworkCore.Storage;
-using Remotion.Linq;
 
 // ReSharper disable once CheckNamespace
 namespace Microsoft.EntityFrameworkCore
 {
     public static class IQueryableExtensions
     {
-        public static string ToSql<TEntity>(this IQueryable<TEntity> self)
-        {
-            var visitor = self.CompileQuery();
-            return string.Join("", visitor.Queries.Select(x => x.ToString().TrimEnd().TrimEnd(';') + ";" + Environment.NewLine));
-        }
-
-        public static IEnumerable<string> ToUnevaluated<TEntity>(this IQueryable<TEntity> self)
-        {
-            var visitor = self.CompileQuery();
-            return VisitExpression(visitor.Expression, null);
-        }
-
-        internal static IEnumerable<string> VisitExpression(Expression expression, dynamic caller)
-        {
-            var ret = new List<string>();
-            dynamic exp = expression;
-
-            if (expression.NodeType == ExpressionType.Lambda)
-            {
-                var resultBuilder = new StringBuilder();
-                if (caller != null)
-                {
-                    resultBuilder.Append(caller.Method.Name.Replace("_", "."));
-                    resultBuilder.Append("(");
-                }
-                resultBuilder.Append(exp.ToString());
-
-                if (caller != null)
-                {
-                    resultBuilder.Append(")");
-                }
-                ret.Add(resultBuilder.ToString());
-            }
-
-            try
-            {
-                if (exp.Arguments.Count > 0)
-                {
-                    foreach (var x in exp.Arguments)
-                    {
-                        ret.AddRange(VisitExpression(x, exp));
-                    }
-                }
-            }
-            catch
-            { }
-
-            return ret;
-        }
-
         public static class ReflectionCommon
         {
             public static readonly FieldInfo QueryCompilerOfEntityQueryProvider = typeof(EntityQueryProvider).GetTypeInfo().DeclaredFields.First(x => x.Name == "_queryCompiler");
-            public static readonly PropertyInfo DatabaseOfQueryCompiler = typeof(QueryCompiler).GetTypeInfo().DeclaredProperties.First(x => x.Name == "Database");
+            public static readonly FieldInfo DatabaseOfQueryCompiler = typeof(QueryCompiler).GetTypeInfo().DeclaredFields.First(x => x.Name == "_database");
             public static readonly PropertyInfo DependenciesOfDatabase = typeof(Database).GetTypeInfo().DeclaredProperties.First(x => x.Name == "Dependencies");
-            public static readonly PropertyInfo DependenciesOfQueryCompilerContextFactory = typeof(QueryCompilationContextFactory).GetTypeInfo().DeclaredProperties.Single(x => x.Name == "Dependencies");
+            public static readonly FieldInfo DependenciesOfQueryCompilerContextFactory = typeof(QueryCompilationContextFactory).GetTypeInfo().DeclaredFields.Single(x => x.Name == "_dependencies");
         }
 
-        public static RelationalQueryModelVisitor CompileQuery<TEntity>(this IQueryable<TEntity> self)
+        private static object Private(this object obj, string privateField) => obj?.GetType().GetField(privateField, BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(obj);
+        private static T Private<T>(this object obj, string privateField) => (T)obj?.GetType().GetField(privateField, BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(obj);
+
+        public static TService GetService<TService>(this IQueryable self)
         {
-            var q = self as EntityQueryable<TEntity>;
-            if (q == null)
+            TService res;
+            if (self.GetType().GetTypeInfo().GetGenericTypeDefinition() == typeof(EntityQueryable<>))
             {
-                return null;
+                var queryCompiler = (QueryCompiler)ReflectionCommon.QueryCompilerOfEntityQueryProvider.GetValue(self.Provider);  // (self.Provider as EntityQueryProvider)._queryCompiler: QueryCompiler
+                var database = (RelationalDatabase)ReflectionCommon.DatabaseOfQueryCompiler.GetValue(queryCompiler);             // QueryCompiler._database: Database
+                var dbDependencies = (DatabaseDependencies)ReflectionCommon.DependenciesOfDatabase.GetValue(database);           // Database.Dependencies: DatabaseDependencies
+                var qccf = dbDependencies.QueryCompilationContextFactory;                                                        // Database.Dependencies.QueryCompilationContextFactory
+                var qccfDependencies = (QueryCompilationContextDependencies)ReflectionCommon.DependenciesOfQueryCompilerContextFactory.GetValue(qccf); // QueryCompilationContextFactory._dependencies: QueryCompilationContextDependencies
+                var context = qccfDependencies.CurrentContext.Context; // DbContext
+                res = context.GetService<TService>();
             }
-
-            var queryCompiler = (QueryCompiler)ReflectionCommon.QueryCompilerOfEntityQueryProvider.GetValue(self.Provider);
-            var database = (Database)ReflectionCommon.DatabaseOfQueryCompiler.GetValue(queryCompiler);
-            var dependencies = (DatabaseDependencies)ReflectionCommon.DependenciesOfDatabase.GetValue(database);
-            var factory = dependencies.QueryCompilationContextFactory;
-            var queryModel = self.GetService<IQueryModelGenerator>().ParseQuery(self.Expression);
-            var modelVisitor = (RelationalQueryModelVisitor)database.CreateVisitor(factory, queryModel);
-            modelVisitor.CreateQueryExecutor<TEntity>(queryModel);
-            return modelVisitor;
+            else if (self.GetType().GetTypeInfo().GetGenericTypeDefinition() == typeof(InternalDbSet<>))
+            {
+                var context = Private<DbContext>(self, "_context");
+                res = context.GetService<TService>();
+            }
+            else
+            {
+                throw new NotSupportedException(self.GetType().Name);
+            }
+            return res;
         }
 
-
-        public static EntityQueryModelVisitor CreateVisitor(this Database self, IQueryCompilationContextFactory factory, QueryModel qm)
+        public static string ToSql<TEntity>(this IQueryable<TEntity> query) where TEntity : class
         {
-            return factory.Create(async: false).CreateQueryModelVisitor();
+            using (var enumerator = query.Provider.Execute<IEnumerable<TEntity>>(query.Expression).GetEnumerator())
+            {
+                var relationalCommandCache = enumerator.Private("_relationalCommandCache");
+                var selectExpression = relationalCommandCache.Private<SelectExpression>("_selectExpression");
+                var factory = relationalCommandCache.Private<IQuerySqlGeneratorFactory>("_querySqlGeneratorFactory");
+                
+                var sqlGenerator = factory.Create();
+                var command = sqlGenerator.GetCommand(selectExpression);
+
+                return command.CommandText;
+            }
         }
     }
 }
